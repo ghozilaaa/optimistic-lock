@@ -12,7 +12,7 @@ import (
 )
 
 func TestConcurrentBalanceUpdates(t *testing.T) {
-	dsn := "host=localhost user=youruser dbname=yourdb password=yourpass sslmode=disable"
+	dsn := "host=localhost user=postgres dbname=optimistic_lock password=postgres sslmode=disable"
 	db, _ := gorm.Open(postgres.Open(dsn), &gorm.Config{})
 
 	db.AutoMigrate(&models.Balance{})
