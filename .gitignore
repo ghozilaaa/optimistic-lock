@@ -1,0 +1,48 @@
+# Environment variables
+.env
+.env.local
+.env.development
+.env.production
+
+# Docker volumes and data
+postgres_data/
+pgadmin_data/
+
+# Go binaries and build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+optimistic-lock
+main
+
+# Go test files and coverage
+*.test
+*.out
+coverage.html
+.coverage
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
