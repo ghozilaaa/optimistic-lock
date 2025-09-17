@@ -8,6 +8,7 @@ import (
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 
 	"github.com/ghozilaaa/optimistic-lock/models"
 	"github.com/ghozilaaa/optimistic-lock/service"
@@ -15,7 +16,11 @@ import (
 
 func TestConcurrentBalanceUpdates(t *testing.T) {
 	dsn := "host=localhost user=postgres dbname=optimistic_lock password=postgres sslmode=disable"
-	db, _ := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	db, _ := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		SkipDefaultTransaction: true, // disable default transaction for write operations
+		Logger:                 logger.Default.LogMode(logger.Silent),
+		PrepareStmt:            true, // creates a prepared statement when executing any SQL and caches them to speed up future calls
+	})
 
 	db.AutoMigrate(&models.Balance{})
 	db.Exec("DELETE FROM balances") // Clear for test
@@ -80,7 +85,23 @@ type TPSTestConfig struct {
 // runTPSTest executes a configurable TPS test
 func runTPSTest(t *testing.T, config TPSTestConfig) {
 	dsn := "host=localhost user=postgres dbname=optimistic_lock password=postgres sslmode=disable"
-	db, _ := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	db, _ := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		SkipDefaultTransaction: true, // disable default transaction for write operations
+		Logger:                 logger.Default.LogMode(logger.Silent),
+		PrepareStmt:            true, // creates a prepared statement when executing any SQL and caches them to speed up future calls
+	})
+
+	// Configure connection pool
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("Failed to get database: %v", err)
+	}
+
+	// Set pool configuration
+	sqlDB.SetMaxIdleConns(25)
+	sqlDB.SetMaxOpenConns(100)
+	sqlDB.SetConnMaxLifetime(5 * time.Minute)
+	sqlDB.SetConnMaxIdleTime(30 * time.Second)
 
 	db.AutoMigrate(&models.Balance{})
 	db.Exec("DELETE FROM balances") // Clear for test
@@ -136,16 +157,17 @@ func runTPSTest(t *testing.T, config TPSTestConfig) {
 	close(errs)
 
 	elapsed := time.Since(now)
-	actualTPS := float64(totalTransactions) / elapsed.Seconds()
-	t.Logf("Test completed in %v, Actual TPS: %.2f", elapsed, actualTPS)
 
 	// Count conflicts and other errors
 	conflictCount := 0
+	successfulRetry := 0
 	otherErrorCount := 0
 	for err := range errs {
 		if err != nil {
-			if err.Error() == "conflict: balance updated by another transaction" {
+			if err.Error() == "conflict: balance updated by another transaction, retry exhausted" {
 				conflictCount++
+			} else if err.Error() == "successful retry" {
+				successfulRetry++
 			} else {
 				otherErrorCount++
 			}
@@ -153,12 +175,14 @@ func runTPSTest(t *testing.T, config TPSTestConfig) {
 	}
 
 	successfulTransactions := totalTransactions - conflictCount - otherErrorCount
+	actualTPS := float64(successfulTransactions) / elapsed.Seconds()
+	t.Logf("Test completed in %v, Actual TPS: %.2f", elapsed, actualTPS)
 
 	// Reload balance
 	var updated models.Balance
 	db.First(&updated, balance.ID)
-	t.Logf("Final balance: %d, successful: %d, conflicts: %d, other errors: %d",
-		updated.Amount, successfulTransactions, conflictCount, otherErrorCount)
+	t.Logf("Final balance: %d, successful: %d, conflicts: %d, other errors: %d, successful retry %d",
+		updated.Amount, successfulTransactions, conflictCount, otherErrorCount, successfulRetry)
 
 	// Verify balance integrity
 	expected := int64(1000 + (int64(successfulTransactions) * config.AmountPerTx))
@@ -187,39 +211,12 @@ func runTPSTest(t *testing.T, config TPSTestConfig) {
 func TestConfigurableTPSScenarios(t *testing.T) {
 	testCases := []TPSTestConfig{
 		{
-			Name:        "Low Load (5 TPS)",
-			TargetTPS:   5,
+			Name:        "400 TPS Stress Test 1",
+			TargetTPS:   400,
 			Duration:    10,
-			AmountPerTx: 10,
-			MinTPS:      4.0,
-			MaxTPS:      6.0,
-			LogFailures: 0, // Log all failures
-		},
-		{
-			Name:        "Medium Load (15 TPS)",
-			TargetTPS:   15,
-			Duration:    10,
-			AmountPerTx: 5,
-			MinTPS:      12.0,
-			MaxTPS:      18.0,
-			LogFailures: 5,
-		},
-		{
-			Name:        "High Load (30 TPS)",
-			TargetTPS:   30,
-			Duration:    10,
-			AmountPerTx: 3,
-			MinTPS:      25.0,
-			MaxTPS:      35.0,
-			LogFailures: 3,
-		},
-		{
-			Name:        "Extreme Load (50 TPS)",
-			TargetTPS:   50,
-			Duration:    10,
-			AmountPerTx: 2,
-			MinTPS:      40.0,
-			MaxTPS:      60.0,
+			AmountPerTx: 1,
+			MinTPS:      380.0,
+			MaxTPS:      400.0,
 			LogFailures: 3,
 		},
 	}
@@ -274,43 +271,42 @@ func TestVariableIntervalTPS(t *testing.T) {
 	t.Logf("Starting Variable Interval TPS test: target %d TPS with dynamic intervals", targetTPS)
 	t.Logf("Base interval: %v (will vary ±50%%)", baseInterval)
 
-	// Launch transactions with variable intervals
-	go func() {
-		transactionCount := 0
-		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	// Launch transactions with variable intervals inline to avoid a race where
+	// WaitGroup.Add is called after Wait has begun (which can panic).
+	transactionCount := 0
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-		for transactionCount < totalTransactions {
-			// Vary interval by ±50% of base interval
-			variance := rng.Float64() - 0.5 // -0.5 to +0.5
-			variableInterval := time.Duration(float64(baseInterval) * (1.0 + variance))
+	for transactionCount < totalTransactions {
+		// Vary interval by ±50% of base interval
+		variance := rng.Float64() - 0.5 // -0.5 to +0.5
+		variableInterval := time.Duration(float64(baseInterval) * (1.0 + variance))
 
-			// Ensure minimum interval of 1ms to prevent overwhelming the system
-			if variableInterval < time.Millisecond {
-				variableInterval = time.Millisecond
-			}
-
-			time.Sleep(variableInterval)
-
-			wg.Add(1)
-			txTime := time.Now()
-			transactionTimes = append(transactionTimes, txTime)
-
-			go func(txNum int, startTime time.Time) {
-				defer wg.Done()
-				err := service.UpdateBalance(db, balance.ID, 3)
-				txDuration := time.Since(startTime)
-
-				if err != nil {
-					errs <- err
-					if txNum <= 5 { // Log first 5 failures
-						t.Logf("Transaction %d failed after %v: %v", txNum, txDuration, err)
-					}
-				}
-			}(transactionCount+1, txTime)
-
-			transactionCount++
+		// Ensure minimum interval of 1ms to prevent overwhelming the system
+		if variableInterval < time.Millisecond {
+			variableInterval = time.Millisecond
 		}
-	}()
+
+		time.Sleep(variableInterval)
+
+		wg.Add(1)
+		txTime := time.Now()
+		transactionTimes = append(transactionTimes, txTime)
+
+		go func(txNum int, startTime time.Time) {
+			defer wg.Done()
+			err := service.UpdateBalance(db, balance.ID, 3)
+			txDuration := time.Since(startTime)
+
+			if err != nil {
+				errs <- err
+				if txNum <= 5 { // Log first 5 failures
+					t.Logf("Transaction %d failed after %v: %v", txNum, txDuration, err)
+				}
+			}
+		}(transactionCount+1, txTime)
+
+		transactionCount++
+	}
 
 	wg.Wait()
 	close(errs)
@@ -319,25 +315,40 @@ func TestVariableIntervalTPS(t *testing.T) {
 	actualTPS := float64(totalTransactions) / elapsed.Seconds()
 
 	// Analyze interval distribution
-	intervals := make([]time.Duration, len(transactionTimes)-1)
+	intervals := make([]time.Duration, 0, len(transactionTimes)-1)
 	var totalInterval time.Duration
-	minInterval := time.Hour // Start with large value
-	maxInterval := time.Duration(0)
+	// Initialize min/max to zero values and only update them when we have
+	// at least one interval. This avoids using absurd initial values if no
+	// intervals were recorded.
+	var minInterval time.Duration
+	var maxInterval time.Duration
 
-	for i := 1; i < len(transactionTimes); i++ {
-		interval := transactionTimes[i].Sub(transactionTimes[i-1])
-		intervals[i-1] = interval
-		totalInterval += interval
+	if len(transactionTimes) >= 2 {
+		for i := 1; i < len(transactionTimes); i++ {
+			interval := transactionTimes[i].Sub(transactionTimes[i-1])
+			intervals = append(intervals, interval)
+			totalInterval += interval
 
-		if interval < minInterval {
-			minInterval = interval
-		}
-		if interval > maxInterval {
-			maxInterval = interval
+			if i == 1 {
+				minInterval = interval
+				maxInterval = interval
+			} else {
+				if interval < minInterval {
+					minInterval = interval
+				}
+				if interval > maxInterval {
+					maxInterval = interval
+				}
+			}
 		}
 	}
 
-	avgInterval := totalInterval / time.Duration(len(intervals))
+	var avgInterval time.Duration
+	if len(intervals) > 0 {
+		avgInterval = totalInterval / time.Duration(len(intervals))
+	} else {
+		avgInterval = 0
+	}
 
 	t.Logf("Test completed in %v, Actual TPS: %.2f", elapsed, actualTPS)
 	t.Logf("Interval Statistics:")
